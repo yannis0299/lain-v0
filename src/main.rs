@@ -1,10 +1,11 @@
 #![allow(unused, dead_code, unused_imports)]
-mod tokenizer;
-mod tu;
+mod ast;          // Abstract syntax tree
+mod tk;           // Lexing & token manipulation    
+mod tu;           // Translation units
 
 use fallible_iterator::{FallibleIterator, IntoFallibleIterator};
 
-use crate::{tokenizer::Tokenizer, tu::TU};
+use crate::{tk::Tokenizer, tu::TU};
 
 fn main() {
     let expr = "\\ xyz_fdhdfjk _ _x _0 x0 xA => ()";
