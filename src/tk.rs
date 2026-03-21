@@ -68,8 +68,7 @@ pub struct Token<'a> {
 }
 
 pub struct Tokenizer<'a> {
-    filename: &'a Path,
-    contents: &'a str,
+    tu: &'a TU,
     chars: Peekable<CharIndices<'a>>,
     pos: Position,
 }
@@ -84,9 +83,8 @@ pub struct TokenizerError {
 impl<'a> Tokenizer<'a> {
     pub fn new(tu: &'a TU) -> Self {
         Tokenizer {
-            filename: Path::new(tu.filename.as_str()),
+            tu,
             pos: Position::default(),
-            contents: tu.contents.as_str(),
             chars: tu.contents.char_indices().peekable(),
         }
     }
@@ -116,13 +114,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn error(&self, message: String) -> TokenizerError {
-        let filename = {
-            self.filename
-                .file_name()
-                .and_then(|os_str| os_str.to_str())
-                .map(String::from)
-                .unwrap_or(String::from("<unknown>"))
-        };
+        let filename = self.tu.filename.clone();
         TokenizerError {
             filename,
             pos: self.pos,
@@ -142,19 +134,19 @@ impl<'a> FallibleIterator for Tokenizer<'a> {
                 kind: TokenKind::Backslash,
                 pos: self.pos,
                 span: Span::new(idx, idx + 1),
-                repr: &self.contents[idx..idx + 1],
+                repr: &self.tu.contents[idx..idx + 1],
             })),
             Some((idx, '(')) => Ok(Some(Token {
                 kind: TokenKind::LeftParen,
                 pos: self.pos,
                 span: Span::new(idx, idx + 1),
-                repr: &self.contents[idx..idx + 1],
+                repr: &self.tu.contents[idx..idx + 1],
             })),
             Some((idx, ')')) => Ok(Some(Token {
                 kind: TokenKind::RightParen,
                 pos: self.pos,
                 span: Span::new(idx, idx + 1),
-                repr: &self.contents[idx..idx + 1],
+                repr: &self.tu.contents[idx..idx + 1],
             })),
             Some((idx, '=')) => {
                 let pos = self.pos;
@@ -163,7 +155,7 @@ impl<'a> FallibleIterator for Tokenizer<'a> {
                         kind: TokenKind::RightParen,
                         pos,
                         span: Span::new(idx, idx + 2),
-                        repr: &self.contents[idx..idx + 2],
+                        repr: &self.tu.contents[idx..idx + 2],
                     })),
                     Some(char) => Err(self.error(format!(
                         "Unexpected token while trying to match right arrow: {:?}",
@@ -191,7 +183,7 @@ impl<'a> FallibleIterator for Tokenizer<'a> {
                         kind: TokenKind::Identifier,
                         pos,
                         span: Span::new(idx, idx + len),
-                        repr: &self.contents[idx..idx + len],
+                        repr: &self.tu.contents[idx..idx + len],
                     }))
                 } else {
                     Err(self.error(format!("Unexpected token {:?}", char)))
