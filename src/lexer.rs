@@ -1,81 +1,111 @@
-use std::{cell::RefCell, str::Chars};
+use crate::tokenizer::{Position, Span, Token, TokenKind, TokenParser};
 
-use crate::monadic::{ParseError, Parser};
-
-#[derive(Debug, Clone, Copy)]
-pub struct Position(pub usize, pub usize);
-
-#[derive(Debug, Clone, Copy)]
-pub struct Span(pub usize, pub usize);
-
-#[derive(Debug, Clone, Copy)]
-pub enum TokenKind {
-    Backslash,
-    RightArrow,
-    LeftParen,
-    RightParen,
-    Identifier,
+pub fn single(c: char) -> TokenParser<char> {
+    TokenParser::new(move |tn| {
+        let c1 = tn.advance()?;
+        if c == c1 {
+            Ok(c)
+        } else {
+            Err(tn.error(format!(
+                "single: Failed to match characters {:?} and {:?}",
+                c, c1
+            )))
+        }
+    })
 }
 
-#[derive(Debug, Clone)]
-pub struct Token<'a> {
-    pub kind: TokenKind,
-    pub pos: Position,
-    pub span: Span,
-    pub repr: &'a str,
+pub fn keyword(name: &'static str) -> TokenParser<(Position, Span)> {
+    TokenParser::new(move |tn| {
+        let start = tn.idx;
+        let pos = tn.pos;
+        for (idx, c) in name.char_indices() {
+            let c1 = tn.advance()?;
+            if c != c1 {
+                return Err(tn.error(format!(
+                    "keyword: Failed to match characters {:?} and {:?} at {}",
+                    c, c1, idx
+                )));
+            }
+        }
+        Ok((pos, Span(start, start + name.len())))
+    })
 }
 
-#[derive(Clone)]
-pub struct Tokenizer<'a> {
-    name: &'a str,
-    contents: &'a str,
-    chars: Chars<'a>,
-    pos: Position,
-    idx: usize,
+pub fn alpha() -> TokenParser<char> {
+    TokenParser::new(move |tn| {
+        let c = tn.advance()?;
+        if c.is_alphabetic() {
+            Ok(c)
+        } else {
+            Err(tn.error(format!("alpha: Not a valid alphabetical character {:?}", c)))
+        }
+    })
 }
 
-impl<'a> Tokenizer<'a> {
-    pub fn advance(&'a mut self) -> Result<char, ParseError<Tokenizer<'a>>>
+pub fn alphanum() -> TokenParser<char> {
+    TokenParser::new(move |tn| {
+        let c = tn.advance()?;
+        if c.is_alphanumeric() {
+            Ok(c)
+        } else {
+            Err(tn.error(format!(
+                "alphanum: Not a valid alphanumerical character {:?}",
+                c
+            )))
+        }
+    })
 }
 
-pub fn advance<'a>() -> Parser<Tokenizer<'_a>, char> {
-    Parser::unit(Box::new(|state| {
-        Ok(('a', state))
-        // let mut saved_state = state.clone();
-        // let mut state = state;
-        // RefCell
-        // match state.chars.next() {
-        //     Some('\n') => {
-        //         state.pos.0 += 1;
-        //         state.pos.1 = 1;
-        //         state.idx += 1;
-        //         Ok(('\n', state))
-        //     }
-        //     Some(c) => {
-        //         state.pos.1 += 1;
-        //         state.idx += 1;
-        //         Ok((c, state))
-        //     }
-        //     None => Err(ParseError {
-        //         state: saved_state,
-        //         msg: format!("Unexpected end of stream"),
-        //     }),
-        // }
-    }))
-
-    // self.chars.next().map(|elem @ (_, char)| {
-    //         match char {
-    //             '\n' => {
-    //                 // Advance line
-    //                 self.pos.0 += 1; // line += 1
-    //                 self.pos.1 = 1; // column = 1
-    //             }
-    //             _ => self.pos.1 += 1, // Advance column
-    //         }
-    //         elem
-    //     })
+pub fn identifier() -> TokenParser<Token> {
+    let p = single('_')
+        .or(alpha())
+        .chain(single('_').or(alphanum()).many())
+        .map(|(_, t)| 1 + t.len());
+    TokenParser::new(move |tn| {
+        let pos = tn.pos;
+        let idx = tn.idx;
+        let len = (p.m)(tn)?;
+        Ok(Token {
+            pos,
+            span: Span(idx, idx + len),
+            kind: TokenKind::Identifier,
+        })
+    })
 }
 
-pub fn keyword<'a>(pattern: &'static str) -> Parser<Tokenizer<'a>, Token<'a>> {
-    todo!()
+pub fn whitespaces() -> TokenParser<Vec<char>> {
+    single(' ').or(single('\t')).or(single('\n')).many()
+}
+
+pub fn skip<T: 'static>(p: TokenParser<T>) -> TokenParser<()> {
+    p.optional().map(|_| ())
+}
+
+pub fn lexer() -> TokenParser<Vec<Token>> {
+    skip(whitespaces())
+        .then(|_| {
+            keyword("\\")
+                .map(|(pos, span)| Token {
+                    kind: TokenKind::Backslash,
+                    pos,
+                    span,
+                })
+                .or(keyword("=>").map(|(pos, span)| Token {
+                    kind: TokenKind::RightArrow,
+                    pos,
+                    span,
+                }))
+                .or(keyword("(").map(|(pos, span)| Token {
+                    kind: TokenKind::LeftParen,
+                    pos,
+                    span,
+                }))
+                .or(keyword(")").map(|(pos, span)| Token {
+                    kind: TokenKind::RightParen,
+                    pos,
+                    span,
+                }))
+                .or(identifier())
+        })
+        .many()
 }
