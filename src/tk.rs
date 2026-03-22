@@ -1,54 +1,12 @@
-use fallible_iterator::FallibleIterator;
-
-use std::{iter::Peekable, path::Path, str::CharIndices};
-
 use crate::tu::TU;
+
+use std::str::Chars;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Position(pub usize, pub usize);
 
-impl Position {
-    #[inline]
-    pub fn line(&self) -> usize {
-        self.0
-    }
-
-    #[inline]
-    pub fn column(&self) -> usize {
-        self.1
-    }
-}
-
-impl Default for Position {
-    fn default() -> Self {
-        Self(1usize, 0usize)
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct Span(pub usize, pub usize);
-
-impl Span {
-    #[inline]
-    pub fn new(start: usize, end: usize) -> Self {
-        Self(start, end)
-    }
-
-    #[inline]
-    pub fn start(&self) -> usize {
-        self.0
-    }
-
-    #[inline]
-    pub fn end(&self) -> usize {
-        self.1
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.1 - self.0 + 1
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 pub enum TokenKind {
@@ -60,135 +18,210 @@ pub enum TokenKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct Token<'a> {
+pub struct Token {
     pub kind: TokenKind,
     pub pos: Position,
     pub span: Span,
-    pub repr: &'a str,
-}
-
-pub struct Tokenizer<'a> {
-    tu: &'a TU,
-    chars: Peekable<CharIndices<'a>>,
-    pos: Position,
 }
 
 #[derive(Debug, Clone)]
-pub struct TokenizerError {
-    pub message: String,
-    pub filename: String,
+pub struct TokenError {
+    pub src: String,
     pub pos: Position,
+    pub idx: usize,
+    pub msg: String,
+}
+
+#[derive(Clone)]
+pub struct Tokenizer<'a> {
+    pub name: &'a str,
+    pub contents: &'a str,
+    pub pos: Position,
+    pub idx: usize,
+    pub chars: Chars<'a>,
 }
 
 impl<'a> Tokenizer<'a> {
-    pub fn new(tu: &'a TU) -> Self {
+    pub fn new(tu: &'a TU) -> Tokenizer<'a> {
         Tokenizer {
-            tu,
-            pos: Position::default(),
-            chars: tu.contents.char_indices().peekable(),
+            name: tu.filename.as_str(),
+            contents: tu.contents.as_str(),
+            pos: Position(1, 1),
+            idx: 0,
+            chars: tu.contents.chars(),
         }
     }
 
-    fn advance_char_by_one(&mut self) -> Option<(usize, char)> {
-        self.chars.next().map(|elem @ (_, char)| {
-            match char {
-                '\n' => {
-                    // Advance line
-                    self.pos.0 += 1; // line += 1
-                    self.pos.1 = 1; // column = 1
-                }
-                _ => self.pos.1 += 1, // Advance column
-            }
-            elem
-        })
-    }
-
-    fn advance_char(&mut self) -> Option<(usize, char)> {
-        loop {
-            let next = self.advance_char_by_one();
-            match next {
-                Some((_, ' ')) | Some((_, '\n')) => continue,
-                _ => break next,
-            }
-        }
-    }
-
-    fn error(&self, message: String) -> TokenizerError {
-        let filename = self.tu.filename.clone();
-        TokenizerError {
-            filename,
+    pub fn error<S>(&self, msg: S) -> TokenError
+    where
+        S: Into<String> + 'static,
+    {
+        TokenError {
+            src: String::from(self.name),
             pos: self.pos,
-            message,
+            idx: self.idx,
+            msg: msg.into(),
+        }
+    }
+
+    pub fn advance(&mut self) -> Result<char, TokenError> {
+        match self.chars.next() {
+            Some('\n') => {
+                self.pos.0 += 1;
+                self.pos.1 = 1;
+                self.idx += 1;
+                Ok('\n')
+            }
+            Some(c) => {
+                self.pos.1 += 1;
+                self.idx += 1;
+                Ok(c)
+            }
+            None => Err(self.error("Unexpected end of character stream")),
         }
     }
 }
 
-impl<'a> FallibleIterator for Tokenizer<'a> {
-    type Item = Token<'a>;
-    type Error = TokenizerError;
+pub type TokenMatcher<T> = dyn Fn(&mut Tokenizer<'_>) -> Result<T, TokenError> + 'static;
 
-    fn next(&mut self) -> Result<Option<Self::Item>, Self::Error> {
-        match self.advance_char() {
-            None => Ok(None),
-            Some((idx, '\\')) => Ok(Some(Token {
-                kind: TokenKind::Backslash,
-                pos: self.pos,
-                span: Span::new(idx, idx + 1),
-                repr: &self.tu.contents[idx..idx + 1],
-            })),
-            Some((idx, '(')) => Ok(Some(Token {
-                kind: TokenKind::LeftParen,
-                pos: self.pos,
-                span: Span::new(idx, idx + 1),
-                repr: &self.tu.contents[idx..idx + 1],
-            })),
-            Some((idx, ')')) => Ok(Some(Token {
-                kind: TokenKind::RightParen,
-                pos: self.pos,
-                span: Span::new(idx, idx + 1),
-                repr: &self.tu.contents[idx..idx + 1],
-            })),
-            Some((idx, '=')) => {
-                let pos = self.pos;
-                match self.advance_char() {
-                    Some((_, '>')) => Ok(Some(Token {
-                        kind: TokenKind::RightParen,
-                        pos,
-                        span: Span::new(idx, idx + 2),
-                        repr: &self.tu.contents[idx..idx + 2],
-                    })),
-                    Some(char) => Err(self.error(format!(
-                        "Unexpected token while trying to match right arrow: {:?}",
-                        char
-                    ))),
-                    None => Err(self.error(String::from(
-                        "Unexpected end of file while trying to match right arrow",
-                    ))),
+pub struct TokenParser<T> {
+    pub m: Box<TokenMatcher<T>>,
+}
+
+impl<T> TokenParser<T>
+where
+    T: 'static,
+{
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&mut Tokenizer<'_>) -> Result<T, TokenError> + 'static,
+    {
+        TokenParser { m: Box::new(f) }
+    }
+
+    pub fn run(self, mut tn: Tokenizer<'_>) -> Result<T, TokenError> {
+        (self.m)(&mut tn)
+    }
+
+    pub fn pure(ret: T) -> Self
+    where
+        T: Copy,
+    {
+        Self::new(move |_| Ok(ret))
+    }
+
+    pub fn failure<S>(msg: S) -> Self
+    where
+        S: Into<String> + 'static,
+    {
+        let msg = msg.into();
+        Self::new(move |tn| {
+            Err(TokenError {
+                src: String::from(tn.name),
+                pos: tn.pos,
+                idx: tn.idx,
+                msg: msg.clone(),
+            })
+        })
+    }
+
+    pub fn map<U, F>(self, f: F) -> TokenParser<U>
+    where
+        U: 'static,
+        F: Fn(T) -> U + 'static,
+    {
+        TokenParser::new(move |tn| {
+            let x = (self.m)(tn)?;
+            Ok(f(x))
+        })
+    }
+
+    pub fn then<U, F>(self, f: F) -> TokenParser<U>
+    where
+        U: 'static,
+        F: Fn(T) -> TokenParser<U> + 'static,
+    {
+        TokenParser::new(move |tn| {
+            let x = (self.m)(tn)?;
+            let g = f(x);
+            let y = (g.m)(tn)?;
+            Ok(y)
+        })
+    }
+
+    pub fn optional(self) -> TokenParser<Option<T>> {
+        TokenParser::new(move |tn| {
+            let saved = tn.clone();
+            match (self.m)(tn) {
+                Err(_) => {
+                    *tn = saved;
+                    Ok(None)
                 }
+                Ok(x) => Ok(Some(x)),
             }
-            Some((idx, char)) => {
-                if char.is_alphabetic() || char == '_' {
-                    let pos = self.pos;
-                    let mut len = 1;
-                    while let Some(true) = self
-                        .chars
-                        .peek()
-                        .map(|(_, peeked)| peeked.is_alphanumeric() || *peeked == '_')
-                    {
-                        self.chars.next();
-                        self.pos.1 += 1;
-                        len += 1;
+        })
+    }
+
+    pub fn or(self, that: TokenParser<T>) -> TokenParser<T> {
+        TokenParser::new(move |tn| {
+            let saved = tn.clone();
+            match (self.m)(tn) {
+                Err(_) => {
+                    *tn = saved;
+                    (that.m)(tn)
+                }
+                Ok(x) => Ok(x),
+            }
+        })
+    }
+
+    pub fn chain<U>(self, that: TokenParser<U>) -> TokenParser<(T, U)>
+    where
+        U: 'static,
+    {
+        TokenParser::new(move |tn| {
+            let x = (self.m)(tn)?;
+            let y = (that.m)(tn)?;
+            Ok((x, y))
+        })
+    }
+
+    pub fn many(self) -> TokenParser<Vec<T>> {
+        TokenParser::new(move |tn| {
+            let mut acc = Vec::new();
+            loop {
+                let saved = tn.clone();
+                match (self.m)(tn) {
+                    Err(_) => {
+                        *tn = saved;
+                        return Ok(acc);
                     }
-                    Ok(Some(Token {
-                        kind: TokenKind::Identifier,
-                        pos,
-                        span: Span::new(idx, idx + len),
-                        repr: &self.tu.contents[idx..idx + len],
-                    }))
-                } else {
-                    Err(self.error(format!("Unexpected token {:?}", char)))
+                    Ok(x) => {
+                        acc.push(x);
+                    }
                 }
             }
+        })
+    }
+}
+
+pub struct TokenStream<'a, T> {
+    tn: Tokenizer<'a>,
+    p: TokenParser<T>,
+}
+
+impl<'a, T> TokenStream<'a, T>
+where
+    T: 'static,
+{
+    pub fn new(tu: &'a TU, p: TokenParser<T>) -> Self {
+        Self {
+            tn: Tokenizer::new(tu),
+            p,
         }
+    }
+
+    pub fn next(&mut self) -> Result<T, TokenError> {
+        (self.p.m)(&mut self.tn)
     }
 }
