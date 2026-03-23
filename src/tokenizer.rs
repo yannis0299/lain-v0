@@ -19,8 +19,12 @@ pub enum TokenKind {
     Underscore,
     Comma,
     Indentation,
+    Comment,
     Newline,
     Keyword,
+    Integer,
+    Character,
+    String,
     Operator,
     Identifier,
 }
@@ -237,6 +241,58 @@ where
                     }
                 }
             }
+        })
+    }
+
+    pub fn many1(self) -> TokenParser<'a, Vec<T>> {
+        TokenParser::new(move |tn| {
+            let mut acc = Vec::new();
+            loop {
+                let saved = tn.clone();
+                match (self.m)(tn) {
+                    Err(_) => {
+                        *tn = saved;
+                        if acc.is_empty() {
+                            return token_error!(tn, "many1: Expecting as least one match");
+                        } else {
+                            return Ok(acc);
+                        }
+                    }
+                    Ok(x) => {
+                        acc.push(x);
+                    }
+                }
+            }
+        })
+    }
+
+    pub fn fold(ps: Vec<TokenParser<'a, T>>) -> TokenParser<'a, T> {
+        let mut ps = ps;
+        let mut mp = ps.pop().expect("pfold: Empty parsers list");
+        for p in ps {
+            mp = mp.or(p);
+        }
+        mp
+    }
+
+    pub fn token<F>(self, f: F) -> TokenParser<'a, Token<'a>>
+    where
+        F: Fn(&str) -> TokenKind + 'a,
+    {
+        TokenParser::new(move |tn| {
+            let pos = tn.pos;
+            let idx = tn.idx;
+            let _ = (self.m)(tn)?;
+            let len = tn.idx - idx;
+            let span = Span(idx, idx + len);
+            let repr = &tn.contents[span.0..span.1];
+            let kind = f(repr);
+            Ok(Token {
+                kind,
+                pos,
+                span,
+                repr,
+            })
         })
     }
 }

@@ -1,3 +1,6 @@
+use lazy_static::lazy_static;
+use std::collections::HashSet;
+
 use crate::tokenizer::{Position, Span, Token, TokenKind, TokenParser, token_error};
 
 pub fn single<'a>(c: char) -> TokenParser<'a, char> {
@@ -16,29 +19,14 @@ pub fn single<'a>(c: char) -> TokenParser<'a, char> {
     })
 }
 
-pub fn keyword<'a>(name: &'static str) -> TokenParser<'a, Token<'a>> {
+pub fn digit<'a>() -> TokenParser<'a, char> {
     TokenParser::new(move |tn| {
-        let start = tn.idx;
-        let pos = tn.pos;
-        for (idx, c) in name.char_indices() {
-            let c1 = tn.advance()?;
-            if c != c1 {
-                return token_error!(
-                    tn,
-                    "keyword: Failed to match characters {:?} and {:?} at {}",
-                    c,
-                    c1,
-                    idx
-                );
-            }
+        let c = tn.advance()?;
+        if c.is_ascii_digit() {
+            Ok(c)
+        } else {
+            token_error!(tn, "digit: Not a valid digital character {:?}", c)
         }
-        let len = name.len();
-        Ok(Token {
-            kind: TokenKind::Keyword,
-            pos,
-            span: Span(start, start + len),
-            repr: &tn.contents[start..start + len],
-        })
     })
 }
 
@@ -61,30 +49,6 @@ pub fn alphanum<'a>() -> TokenParser<'a, char> {
         } else {
             token_error!(tn, "alphanum: Not a valid alphanumerical character {:?}", c)
         }
-    })
-}
-
-pub fn identifier<'a>() -> TokenParser<'a, Token<'a>> {
-    let head = TokenParser::or(
-        single('_').chain(alpha()).map(|(u, v)| vec![u, v]),
-        alpha().map(|u| vec![u]),
-    );
-    let tail = alphanum().many();
-    let ident = head.chain(tail).map(|(u, v)| {
-        let mut u = u;
-        u.extend(v);
-        u
-    });
-    TokenParser::new(move |tn| {
-        let pos = tn.pos;
-        let idx = tn.idx;
-        let len = (ident.m)(tn)?.len();
-        Ok(Token {
-            kind: TokenKind::Identifier,
-            pos,
-            span: Span(idx, idx + len),
-            repr: &tn.contents[idx..idx + len],
-        })
     })
 }
 
@@ -143,28 +107,173 @@ pub fn whitespaces<'a>() -> TokenParser<'a, Vec<Token<'a>>> {
     })
 }
 
-pub fn pfold<'a, T: 'a>(ps: Vec<TokenParser<'a, T>>) -> TokenParser<'a, T> {
-    let mut ps = ps;
-    let mut mp = ps.pop().expect("pfold: Empty parsers list");
-    for p in ps {
-        mp = mp.or(p);
-    }
-    mp
+pub fn comment<'a>() -> TokenParser<'a, Token<'a>> {
+    TokenParser::new(|tn| {
+        let mut uv = [tn.advance()?, tn.advance()?];
+        if uv == ['{', ':'] {
+            loop {
+                uv[0] = uv[1];
+                uv[1] = tn.advance()?;
+                if uv == [':', '}'] {
+                    break;
+                }
+            }
+            Ok(())
+        } else {
+            token_error!(
+                tn,
+                "comment: Comment blocks must start with {{: and and end with :}}"
+            )
+        }
+    })
+    .token(|_| TokenKind::Comment)
+}
+
+pub fn integer<'a>() -> TokenParser<'a, Token<'a>> {
+    TokenParser::optional(single('-'))
+        .chain(digit().many1())
+        .map(|(s, t)| {
+            if let Some(h) = s {
+                let mut acc = vec![h];
+                acc.extend(t);
+                acc
+            } else {
+                t
+            }
+        })
+        .token(|_| TokenKind::Integer)
+}
+
+pub fn character<'a>() -> TokenParser<'a, Token<'a>> {
+    TokenParser::new(|tn| {
+        if tn.advance()? == '\'' {
+            let mut escaped = false;
+            loop {
+                let c = tn.advance()?;
+                if !escaped && c == '\\' {
+                    escaped = true;
+                }
+                if escaped {
+                    escaped = false;
+                }
+                if !escaped && c == '\'' {
+                    break;
+                }
+            }
+            Ok(())
+        } else {
+            token_error!(
+                tn,
+                "character: Character literals must start with a single quote"
+            )
+        }
+    })
+    .token(|_| TokenKind::Character)
+}
+
+pub fn string<'a>() -> TokenParser<'a, Token<'a>> {
+    TokenParser::new(|tn| {
+        if tn.advance()? == '"' {
+            let mut escaped = false;
+            loop {
+                let c = tn.advance()?;
+                if !escaped && c == '\\' {
+                    escaped = true;
+                }
+                if escaped {
+                    escaped = false;
+                }
+                if !escaped && c == '"' {
+                    break;
+                }
+            }
+            Ok(())
+        } else {
+            token_error!(tn, "string: String literals must start with a double quote")
+        }
+    })
+    .token(|_| TokenKind::String)
+}
+
+pub fn keyword<'a>(name: &'static str) -> TokenParser<'a, Token<'a>> {
+    TokenParser::new(move |tn| {
+        for (idx, c) in name.char_indices() {
+            let c1 = tn.advance()?;
+            if c != c1 {
+                return token_error!(
+                    tn,
+                    "keyword: Failed to match characters {:?} and {:?} at {}",
+                    c,
+                    c1,
+                    idx
+                );
+            }
+        }
+        Ok(())
+    })
+    .token(|_| TokenKind::Keyword)
+}
+
+lazy_static! {
+    static ref RESERVED_NAMES: HashSet<&'static str> = vec![
+        "match", "with", "if", "then", "else", "let", "where", "do", "data", "type", "use"
+    ]
+    .into_iter()
+    .collect();
+    static ref RESERVED_OPERATORS: HashSet<&'static str> =
+        vec!["\\", "=>", "=", ":", "<-", "..", "@", "|"]
+            .into_iter()
+            .collect();
+}
+
+pub fn op_letter<'a>() -> TokenParser<'a, char> {
+    TokenParser::fold(
+        vec![
+            ':', '!', '#', '$', '%', '&', '*', '+', '.', '/', '<', '=', '>', '@', '\\', '^', '|',
+            '-', '~',
+        ]
+        .into_iter()
+        .map(single)
+        .collect::<Vec<_>>(),
+    )
+}
+
+pub fn operator<'a>() -> TokenParser<'a, Token<'a>> {
+    op_letter().many1().token(|repr| {
+        if RESERVED_OPERATORS.contains(repr) {
+            TokenKind::Keyword
+        } else {
+            TokenKind::Operator
+        }
+    })
+}
+
+pub fn identifier<'a>() -> TokenParser<'a, Token<'a>> {
+    let ident_start = TokenParser::or(single('_'), alpha());
+    let ident_letter = TokenParser::or(single('_'), alphanum());
+    ident_start
+        .chain(ident_letter.many())
+        .map(|(h, t)| {
+            let mut acc = vec![h];
+            acc.extend(t);
+            acc
+        })
+        .token(|repr| {
+            if RESERVED_NAMES.contains(repr) {
+                TokenKind::Keyword
+            } else {
+                TokenKind::Identifier
+            }
+        })
 }
 
 pub fn lexeme<'a>() -> TokenParser<'a, Token<'a>> {
-    pfold(vec![
-        keyword("\\"),
-        keyword("=>"),
-        keyword("="),
-        keyword(":"),
-        keyword("<-"),
-        keyword("match"),
-        keyword("if"),
-        keyword("then"),
-        keyword("else"),
-        keyword("where"),
-        keyword("do"),
+    TokenParser::fold(vec![
+        comment(),
+        integer(),
+        character(),
+        string(),
+        operator(),
         identifier(),
         keyword("(").map(|tk| Token {
             kind: TokenKind::LeftParen,
@@ -197,14 +306,16 @@ pub fn lexeme<'a>() -> TokenParser<'a, Token<'a>> {
     ])
 }
 
+pub fn token_or_block<'a>() -> TokenParser<'a, Vec<Token<'a>>> {
+    whitespaces().chain(lexeme()).map(|(t, h)| {
+        let mut t = t;
+        t.push(h);
+        t
+    })
+}
+
 pub fn lexer<'a>() -> TokenParser<'a, Vec<Token<'a>>> {
-    whitespaces()
-        .chain(lexeme())
-        .map(|(t, h)| {
-            let mut t = t;
-            t.push(h);
-            t
-        })
+    token_or_block()
         .many()
         .map(|vs| vs.into_iter().flatten().collect::<Vec<_>>())
 }
