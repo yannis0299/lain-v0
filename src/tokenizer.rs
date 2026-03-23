@@ -14,6 +14,10 @@ pub struct Span(pub usize, pub usize);
 pub enum TokenKind {
     LeftParen,
     RightParen,
+    LeftBracket,
+    RightBracket,
+    Underscore,
+    Comma,
     Indentation,
     Newline,
     Keyword,
@@ -94,7 +98,11 @@ impl<'a> Tokenizer<'a> {
                 Ok('\n')
             }
             Some(c @ '\t') | Some(c @ '\r') => {
-                token_error!(self, "advance: Invalid whitespace character {:?}\nSpaces and newlines are the only supported whitespaces characters!", c)
+                token_error!(
+                    self,
+                    "advance: Invalid whitespace character {:?}\nSpaces and newlines are the only supported whitespaces characters!",
+                    c
+                )
             }
             Some(c) => {
                 self.pos.1 += 1;

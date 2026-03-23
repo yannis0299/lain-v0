@@ -10,6 +10,8 @@ use translation_unit::TU;
 
 fn main() {
     let mut buf = r#"
+_ = void
+
 add u v = plus v u
 
 main = \f x y => do
@@ -25,7 +27,7 @@ main = \f x y => do
     };
     let tn = Tokenizer::new(&tu);
     let tokens = lexer().run(tn).unwrap();
-    println!(" Expr := {}", tu.contents);
+    println!(" Expr := {:#?}", tu.contents);
     for token in tokens {
         let unprintable = format!("{:?}", token);
         println!(

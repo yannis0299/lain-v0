@@ -65,14 +65,20 @@ pub fn alphanum<'a>() -> TokenParser<'a, char> {
 }
 
 pub fn identifier<'a>() -> TokenParser<'a, Token<'a>> {
-    let p = single('_')
-        .or(alpha())
-        .chain(single('_').or(alphanum()).many())
-        .map(|(_, t)| 1 + t.len());
+    let head = TokenParser::or(
+        single('_').chain(alpha()).map(|(u, v)| vec![u, v]),
+        alpha().map(|u| vec![u]),
+    );
+    let tail = alphanum().many();
+    let ident = head.chain(tail).map(|(u, v)| {
+        let mut u = u;
+        u.extend(v);
+        u
+    });
     TokenParser::new(move |tn| {
         let pos = tn.pos;
         let idx = tn.idx;
-        let len = (p.m)(tn)?;
+        let len = (ident.m)(tn)?.len();
         Ok(Token {
             kind: TokenKind::Identifier,
             pos,
@@ -159,6 +165,7 @@ pub fn lexeme<'a>() -> TokenParser<'a, Token<'a>> {
         keyword("else"),
         keyword("where"),
         keyword("do"),
+        identifier(),
         keyword("(").map(|tk| Token {
             kind: TokenKind::LeftParen,
             ..tk
@@ -167,7 +174,26 @@ pub fn lexeme<'a>() -> TokenParser<'a, Token<'a>> {
             kind: TokenKind::LeftParen,
             ..tk
         }),
-        identifier(),
+        keyword("(").map(|tk| Token {
+            kind: TokenKind::LeftParen,
+            ..tk
+        }),
+        keyword("[").map(|tk| Token {
+            kind: TokenKind::LeftBracket,
+            ..tk
+        }),
+        keyword("]").map(|tk| Token {
+            kind: TokenKind::RightBracket,
+            ..tk
+        }),
+        keyword("_").map(|tk| Token {
+            kind: TokenKind::Underscore,
+            ..tk
+        }),
+        keyword(",").map(|tk| Token {
+            kind: TokenKind::Comma,
+            ..tk
+        }),
     ])
 }
 
