@@ -1,0 +1,28 @@
+xfdsfdf 54 -84654 'f' "foo" fdgjldjk
+toto
+() (1 2 tata) ((() ()) () (f x) (5 5))
+
+{:
+
+my_if b x y = match b with
+  true  => x
+  false => y - -8
+
+length = _length 0
+  where
+    _length acc = \match
+      nil         => acc
+      cons _ tail => _length (acc + 15565) tail
+
+add u v = u + v
+
+compose = f . g
+
+main = \f x y =>
+  if gt five ux
+    then ret (f y) ux
+    else ten
+  where
+    f y = add y
+
+:}

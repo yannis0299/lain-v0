@@ -280,11 +280,7 @@ pub fn lexeme<'a>() -> TokenParser<'a, Token<'a>> {
             ..tk
         }),
         keyword(")").map(|tk| Token {
-            kind: TokenKind::LeftParen,
-            ..tk
-        }),
-        keyword("(").map(|tk| Token {
-            kind: TokenKind::LeftParen,
+            kind: TokenKind::RightParen,
             ..tk
         }),
         keyword("[").map(|tk| Token {

@@ -1,23 +1,26 @@
+#![feature(error_generic_member_access)]
+mod ast;
 mod lexer;
 mod tokenizer;
 mod translation_unit;
 
+use ast::ASTBuilder;
+use eyre::Context;
 use lexer::lexer;
-use tokenizer::Tokenizer;
+use tokenizer::{TokenKind, Tokenizer};
 use translation_unit::TU;
 
-fn main() {
-    let buf = include_str!("../test.ln");
-    let tu = TU {
-        filename: "<test.ln>".into(),
-        contents: buf.into(),
-    };
+fn main() -> eyre::Result<()> {
+    let tu = TU::from_file("test.ln").wrap_err("Could not read source file")?;
     let tn = Tokenizer::new(&tu);
     println!("-- File: ---------------------");
-    print!("{:#}", buf);
-    println!("------------------------------");
-    let tokens = lexer().run(tn).unwrap();
-    for token in tokens {
+    print!("{:#}", &tn.contents);
+    println!("-- Tokens: -------------------");
+    let tokens = lexer().run(tn).wrap_err("Could not lex source file")?;
+    for token in tokens
+        .iter()
+        .filter(|token| !token.kind.eq(&TokenKind::Comment))
+    {
         let unprintable = format!("{:?}", token);
         println!(
             "{:^16} | {}",
@@ -25,4 +28,11 @@ fn main() {
             unprintable
         );
     }
+    println!("-- AST: ----------------------");
+    let mut ast_builder = ASTBuilder::new(tokens);
+    ast_builder.exhaust()?;
+    println!("frame_stack = {:#?}", ast_builder.frame_stack);
+    println!("app_buffer  = {:#?}", ast_builder.app_buffer);
+    println!("------------------------------");
+    Ok(())
 }

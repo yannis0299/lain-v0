@@ -1,5 +1,7 @@
 use crate::translation_unit::TU;
 
+use std::error::Error;
+use std::fmt::Display;
 use std::iter::Peekable;
 use std::str::Chars;
 
@@ -10,7 +12,7 @@ pub struct Position(pub usize, pub usize);
 pub struct Span(pub usize, pub usize);
 
 #[allow(unused)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     LeftParen,
     RightParen,
@@ -45,6 +47,28 @@ pub struct TokenError {
     pub pos: Position,
     pub idx: usize,
     pub msg: String,
+}
+
+impl Display for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{:?}", self)
+    }
+}
+
+impl Error for TokenError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
+    }
+
+    fn description(&self) -> &str {
+        self.msg.as_str()
+    }
+
+    fn cause(&self) -> Option<&dyn Error> {
+        self.source()
+    }
+
+    fn provide<'a>(&'a self, _request: &mut std::error::Request<'a>) {}
 }
 
 #[derive(Clone)]
