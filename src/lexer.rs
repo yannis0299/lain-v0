@@ -122,7 +122,7 @@ pub fn keyword(name: &str, kind: TokenKind) -> MonadMatcher<TokenStream, Token> 
 
 lazy_static! {
     static ref RESERVED_NAMES: HashSet<&'static str> =
-        vec!["match", "with", "if", "then", "else", "let", "where", "do"]
+        vec!["_", "match", "with", "if", "then", "else", "let", "where", "do"]
             .into_iter()
             .collect();
     static ref RESERVED_OPERATORS: HashSet<&'static str> =
@@ -168,7 +168,7 @@ pub fn identifier() -> MonadMatcher<TokenStream, Token> {
     let ident_letter = single('_').or(alphanum());
     let m = ident_start
         .chain(ident_letter.many())
-        .map(|((pos, idx, _), u)| (pos, idx, u.len()));
+        .map(|((pos, idx, _), u)| (pos, idx, 1 + u.len()));
     MonadMatcher::new(move |state: &mut TokenStream| {
         let (pos, idx, len) = (m.0)(state)?;
         let repr = &state.contents[idx..idx + len];
