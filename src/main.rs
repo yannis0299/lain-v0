@@ -8,15 +8,16 @@ use crate::lexer::lexer;
 use crate::stream::TokenStream;
 
 use ast::ASTBuilder;
-use eyre::Result;
+use eyre::{ContextCompat, Result};
+use std::env::args;
 use std::fs::File;
 use std::io::Read;
 
-fn main() -> Result<()> {
-    let mut file = File::open("test.ln")?;
+fn do_file(filename: &str) -> Result<()> {
+    let mut file = File::open(filename)?;
     let mut buf = String::new();
     file.read_to_string(&mut buf)?;
-    println!("-- File: ---------------------");
+    println!("-- File: {:-<21}", format!("{} ", filename));
     print!("{:#}", buf);
     println!("-- Tokens: -------------------");
     let mut token_stream = TokenStream::new("test.ln", &buf[..]);
@@ -31,8 +32,18 @@ fn main() -> Result<()> {
         );
     }
     println!("-- AST: ----------------------");
-    let mut ast_builder = ASTBuilder::new(&buf);
-    ast_builder.eat_tokens(&tokens[..])?;
+    let ast_builder = ASTBuilder::new(&buf);
+    let ast = ast_builder.build(&tokens)?;
+    println!("AST = {:#?}", ast);
     println!("------------------------------");
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let mut argv = args();
+    argv.next().wrap_err("unreachable")?;
+    for filename in argv {
+        do_file(&filename)?;
+    }
     Ok(())
 }

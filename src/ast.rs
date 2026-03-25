@@ -1,5 +1,3 @@
-use std::mem;
-
 use crate::lexer::{Token, TokenKind};
 
 use eyre::{bail, ContextCompat, Result};
@@ -13,82 +11,60 @@ pub enum RawAST {
     Integer(i32),          // k
     Wildcard,              // _
     Variable(String),      // ident
-    Tuple(AST, ASTs, AST), // (e1, .., eN) at least 2 elements
+    Tuple(AST, ASTs, AST), // (e1, .., eN) at least 0 elements
     List(ASTs),            // [e1, .., eN] can have 0 elements
     // Composite expression
-    Application(AST, ASTs, AST),
+    Lambda(AST, AST),            // \ e1 => e2
+    Application(AST, ASTs, AST), // e1 .. eN
+    IfThenElse(AST, AST, AST),   // if e1 then e2 else e3
 }
 
+#[allow(clippy::upper_case_acronyms)]
 pub type AST = Box<RawAST>;
 pub type ASTs = Vec<RawAST>;
 
 #[derive(Debug, Clone)]
 pub enum Frame {
-    AtomList,
+    AtomsAcc(ASTs),
     TupleAcc(ASTs),
     ListAcc(ASTs),
+    IfWaitingForThen,
+    IfThenWaitingForElse(AST),
+    IfThenElseWaitingForReduction(AST, AST),
+    LambdaWaitingForFatArrow,
+    LambdaWaitingForReduction(AST),
+    ReducedAST(RawAST),
 }
 
 pub struct ASTBuilder<'a> {
     pub contents: &'a str,
-    pub frame_stack: Vec<(Frame, ASTs)>,
+    pub frame_stack: Vec<Frame>,
 }
 
 impl<'a> ASTBuilder<'a> {
-    pub fn new(contents: &'a str) -> Self {
-        Self {
-            contents,
-            frame_stack: vec![(Frame::AtomList, vec![])],
+    pub fn build(mut self, tokens: &[Token]) -> Result<AST> {
+        self.eat_tokens(tokens)?;
+        match self.frame_stack.pop() {
+            Some(Frame::ReducedAST(ast)) => Ok(Box::new(ast)),
+            _ => bail!("ASTBuilder: Malformed expression"),
         }
-    }
-
-    pub fn push_atom(&mut self, atom: RawAST) -> Result<()> {
-        let (_, app_buffer) = self.last_frame_mut()?;
-        app_buffer.push(atom);
-        Ok(())
-    }
-
-    pub fn push_frame(&mut self, frame: Frame) {
-        self.frame_stack.push((frame, vec![]));
-    }
-
-    pub fn reduce_app_buffer(mut app_buffer: ASTs) -> Result<RawAST> {
-        let ast = match app_buffer.len() {
-            0 => RawAST::Empty,
-            1 => app_buffer.pop().wrap_err("unreachable")?,
-            _ => {
-                let last = app_buffer.pop().wrap_err("unreachable")?;
-                let mut app_buffer = app_buffer.into_iter().rev().collect::<Vec<_>>();
-                let head = app_buffer.pop().wrap_err("unreachable")?;
-                RawAST::Application(Box::new(head), app_buffer, Box::new(last))
-            }
-        };
-        Ok(ast)
-    }
-
-    pub fn last_frame_mut(&mut self) -> Result<&mut (Frame, ASTs)> {
-        self.frame_stack
-            .last_mut()
-            .wrap_err("ASTBuilder: attempting to reference last frame in an empty stack")
     }
 
     pub fn eat_tokens(&mut self, tokens: &[Token]) -> Result<()> {
         for token in tokens {
-            println!("token = {:?}", token);
-            println!("frame_stack = {:#?}", self.frame_stack);
             match token.kind {
                 TokenKind::Underscore => {
-                    self.push_atom(RawAST::Wildcard)?;
+                    self.push_atom(RawAST::Wildcard);
                 }
                 TokenKind::Integer => {
                     let repr = &self.contents[token.span.0..token.span.1];
                     let value = repr.parse()?;
-                    self.push_atom(RawAST::Integer(value))?;
+                    self.push_atom(RawAST::Integer(value));
                 }
                 TokenKind::Identifier => {
                     let repr = &self.contents[token.span.0..token.span.1];
                     let value = String::from(repr);
-                    self.push_atom(RawAST::Variable(value))?;
+                    self.push_atom(RawAST::Variable(value));
                 }
                 TokenKind::LeftParen => {
                     let frame = Frame::TupleAcc(vec![]);
@@ -98,57 +74,67 @@ impl<'a> ASTBuilder<'a> {
                     let frame = Frame::ListAcc(vec![]);
                     self.push_frame(frame);
                 }
-                TokenKind::Comma => match self.last_frame_mut()? {
-                    (Frame::TupleAcc(acc), app_buffer) | (Frame::ListAcc(acc), app_buffer) => {
-                        let mut old_buffer = vec![];
-                        mem::swap(app_buffer, &mut old_buffer);
-                        let ast = Self::reduce_app_buffer(old_buffer)?;
-                        acc.push(ast);
-                    }
-                    _ => bail!("ASTBuilder: Encountering comma in a none tuple or list expression"),
-                },
-                TokenKind::RightParen => match self.frame_stack.pop() {
-                    Some((Frame::TupleAcc(mut acc), app_buffer)) => {
-                        let ast = Self::reduce_app_buffer(app_buffer)?;
-                        match ast {
-                            RawAST::Empty => (),
-                            _ => acc.push(ast),
+                TokenKind::Comma => {
+                    self.reduce_frames_until(|frame| {
+                        matches!(frame, Frame::TupleAcc(_) | Frame::ListAcc(_))
+                    })?;
+                }
+                TokenKind::RightParen => {
+                    self.reduce_frames_until(|frame| matches!(frame, Frame::TupleAcc(_)))?;
+                    match self.pop_frame()? {
+                        Frame::TupleAcc(mut acc) => {
+                            let atom = match acc.len() {
+                                0 => RawAST::Unit,
+                                1 => acc.pop().wrap_err("unreachable")?,
+                                _ => {
+                                    let mut tail = acc.split_off(1);
+                                    let head = acc.pop().wrap_err("unreachable")?;
+                                    let last = tail.pop().wrap_err("unreachable")?;
+                                    RawAST::Tuple(Box::new(head), tail, Box::new(last))
+                                }
+                            };
+                            self.push_atom(atom);
                         }
-                        let atom = match acc.len() {
-                            0 => RawAST::Unit,
-                            1 => acc.pop().wrap_err("unreachable")?,
-                            _ => {
-                                let mut tail = acc.split_off(1);
-                                let head = acc.pop().wrap_err("unreachable")?;
-                                let last = tail.pop().wrap_err("unreachable")?;
-                                RawAST::Tuple(Box::new(head), tail, Box::new(last))
-                            }
-                        };
-                        self.push_atom(atom)?;
+                        _ => bail!(
+                            "ASTBuilder: Attempting to close tuple without an opening parenthesis"
+                        ),
                     }
-                    _ => {
-                        bail!("ASTBuilder: Attempting to close a tuple with an opening parethesis")
-                    }
-                },
-                TokenKind::RightBracket => match self.frame_stack.pop() {
-                    Some((Frame::ListAcc(mut acc), app_buffer)) => {
-                        let ast = Self::reduce_app_buffer(app_buffer)?;
-                        match ast {
-                            RawAST::Empty => (),
-                            _ => acc.push(ast),
+                }
+                TokenKind::RightBracket => {
+                    self.reduce_frames_until(|frame| matches!(frame, Frame::ListAcc(_)))?;
+                    match self.pop_frame()? {
+                        Frame::ListAcc(acc) => {
+                            let atom = RawAST::List(acc);
+                            self.push_atom(atom);
                         }
-                        let atom = RawAST::List(acc);
-                        self.push_atom(atom)?;
+                        _ => {
+                            bail!("ASTBuilder: Attempting to close list without an opening bracket")
+                        }
                     }
-                    _ => {
-                        bail!("ASTBuilder: Attempting to close a list with an opening bracket")
-                    }
-                },
-                TokenKind::If => todo!(),
-                TokenKind::Then => todo!(),
-                TokenKind::Else => todo!(),
-                TokenKind::Backslash => todo!(),
-                TokenKind::RightFatArrow => todo!(),
+                }
+                TokenKind::If => {
+                    let frame = Frame::IfWaitingForThen;
+                    self.push_frame(frame);
+                }
+                TokenKind::Then => {
+                    self.reduce_frames_until(|frame| {
+                        matches!(frame, Frame::IfThenWaitingForElse(_))
+                    })?;
+                }
+                TokenKind::Else => {
+                    self.reduce_frames_until(|frame| {
+                        matches!(frame, Frame::IfThenElseWaitingForReduction(_, _))
+                    })?;
+                }
+                TokenKind::Backslash => {
+                    let frame = Frame::LambdaWaitingForFatArrow;
+                    self.push_frame(frame);
+                }
+                TokenKind::RightFatArrow => {
+                    self.reduce_frames_until(|frame| {
+                        matches!(frame, Frame::LambdaWaitingForReduction(_))
+                    })?;
+                }
                 TokenKind::Operator => todo!(),
                 TokenKind::Match => todo!(),
                 TokenKind::With => todo!(),
@@ -162,6 +148,141 @@ impl<'a> ASTBuilder<'a> {
                 TokenKind::VerticalLine => todo!(),
             }
         }
+        self.reduce_frames_until(|frame| matches!(frame, Frame::ReducedAST(_)))
+    }
+
+    pub fn last_frame(&self) -> Result<&Frame> {
+        self.frame_stack
+            .last()
+            .wrap_err("ASTBuilder: attempting to reference last frame in an empty stack")
+    }
+
+    pub fn new(contents: &'a str) -> Self {
+        Self {
+            contents,
+            frame_stack: vec![],
+        }
+    }
+
+    pub fn pop_frame(&mut self) -> Result<Frame> {
+        self.frame_stack
+            .pop()
+            .wrap_err("ASTBuilder: attempting to pop last frame in an empty stack")
+    }
+
+    pub fn push_atom(&mut self, atom: RawAST) {
+        match self.frame_stack.last_mut() {
+            Some(Frame::AtomsAcc(acc)) => acc.push(atom),
+            _ => self.push_frame(Frame::AtomsAcc(vec![atom])),
+        };
+    }
+
+    pub fn push_frame(&mut self, frame: Frame) {
+        self.frame_stack.push(frame);
+    }
+
+    pub fn reduce_frames_until<P>(&mut self, pred: P) -> Result<()>
+    where
+        P: Fn(&Frame) -> bool + 'static,
+    {
+        loop {
+            self.reduce_top_frame()?;
+            if self.frame_stack.is_empty() || (pred)(self.last_frame()?) {
+                break;
+            }
+        }
         Ok(())
+    }
+
+    pub fn reduce_top_frame(&mut self) -> Result<()> {
+        match self.pop_frame()? {
+            Frame::AtomsAcc(mut acc) => {
+                let ast = match acc.len() {
+                    0 => RawAST::Empty,
+                    1 => acc.pop().wrap_err("unreachable")?,
+                    _ => {
+                        let mut tail = acc.split_off(1);
+                        let head = acc.pop().wrap_err("unreachable")?;
+                        let last = tail.pop().wrap_err("unreachable")?;
+                        RawAST::Application(Box::new(head), tail, Box::new(last))
+                    }
+                };
+                self.push_frame(Frame::ReducedAST(ast));
+                Ok(())
+            }
+            Frame::TupleAcc(mut acc) => {
+                acc.push(RawAST::Empty);
+                self.push_frame(Frame::TupleAcc(acc));
+                Ok(())
+            }
+            Frame::ListAcc(mut acc) => {
+                acc.push(RawAST::Empty);
+                self.push_frame(Frame::TupleAcc(acc));
+                Ok(())
+            }
+            Frame::IfWaitingForThen => {
+                bail!("ASTBuilder: Empty expression between if and then tokens")
+            }
+            Frame::IfThenWaitingForElse(_) => {
+                bail!("ASTBuilder: Empty expression between then and else tokens")
+            }
+            Frame::IfThenElseWaitingForReduction(_, _) => {
+                bail!("ASTBuilder: Empty expression after else token")
+            }
+            Frame::LambdaWaitingForFatArrow => {
+                bail!("ASTBuilder: Empty expression backslash and fat arrow")
+            }
+            Frame::LambdaWaitingForReduction(_) => {
+                bail!("ASTBuilder: Empty lambda body after fat arrow")
+            }
+            Frame::ReducedAST(ast) => {
+                if self.frame_stack.is_empty() {
+                    self.push_frame(Frame::ReducedAST(ast));
+                    Ok(())
+                } else {
+                    match self.pop_frame()? {
+                        Frame::AtomsAcc(_) => bail!("ASTBuilder: Ambiguis expression after an atom list, please use parenthesis"),
+                        Frame::TupleAcc(mut acc) => {
+                            acc.push(ast);
+                            self.push_frame(Frame::TupleAcc(acc));
+                            Ok(())
+                        },
+                        Frame::ListAcc(mut acc) =>  {
+                            acc.push(ast);
+                            self.push_frame(Frame::ListAcc(acc));
+                            Ok(())
+                        },
+                        Frame::IfWaitingForThen => {
+                            let frame = Frame::IfThenWaitingForElse(Box::new(ast));
+                            self.push_frame(frame);
+                            Ok(())
+                        },
+                        Frame::IfThenWaitingForElse(e1) => {
+                            let frame = Frame::IfThenElseWaitingForReduction(e1, Box::new(ast));
+                            self.push_frame(frame);
+                            Ok(())
+                        },
+                        Frame::IfThenElseWaitingForReduction(e1, e2) => {
+                            let e3 = Box::new(ast);
+                            let ast = RawAST::IfThenElse(e1, e2, e3);
+                            self.push_frame(Frame::ReducedAST(ast));
+                            Ok(())
+                        },
+                        Frame::LambdaWaitingForFatArrow => {
+                            let frame = Frame::LambdaWaitingForReduction(Box::new(ast));
+                            self.push_frame(frame);
+                            Ok(())
+                        },
+                        Frame::LambdaWaitingForReduction(e1) => {
+                            let e2 = Box::new(ast);
+                            let ast = RawAST::Lambda(e1, e2);
+                            self.push_frame(Frame::ReducedAST(ast));
+                            Ok(())
+                        },
+                        Frame::ReducedAST(_) => bail!("ASTBuilder: Ambiguis expression after another expression, please use parenthesis"),
+                    }
+                }
+            }
+        }
     }
 }

@@ -197,6 +197,9 @@ pub fn lexeme() -> MonadMatcher<TokenStream, Token> {
         keyword(",", TokenKind::Comma),
         keyword("\\", TokenKind::Backslash),
         keyword("=>", TokenKind::RightFatArrow),
+        keyword("if", TokenKind::If),
+        keyword("then", TokenKind::Then),
+        keyword("else", TokenKind::Else),
     ])
 }
 
