@@ -1,6 +1,10 @@
+use std::collections::HashMap;
+
 use crate::lexer::{Token, TokenKind};
 
 use eyre::{bail, ContextCompat, Result};
+use fallible_iterator::Empty;
+use lazy_static::lazy_static;
 
 #[derive(Debug, Clone)]
 pub enum RawAST {
@@ -17,11 +21,20 @@ pub enum RawAST {
     Lambda(AST, AST),            // \ e1 => e2
     Application(AST, ASTs, AST), // e1 .. eN
     IfThenElse(AST, AST, AST),   // if e1 then e2 else e3
+    Operator(String, AST, AST),  // e1 `op` e2
 }
 
 #[allow(clippy::upper_case_acronyms)]
 pub type AST = Box<RawAST>;
 pub type ASTs = Vec<RawAST>;
+
+#[derive(Debug, Clone)]
+pub enum OperatorAssoc {
+    Postfix,
+    Prefix,
+    InfixLeft,
+    InfixRight,
+}
 
 #[derive(Debug, Clone)]
 pub enum Frame {
@@ -33,7 +46,17 @@ pub enum Frame {
     IfThenElseWaitingForReduction(AST, AST),
     LambdaWaitingForFatArrow,
     LambdaWaitingForReduction(AST),
+    OperatorAcc(String, OperatorAssoc, i32, AST, AST),
     ReducedAST(RawAST),
+}
+
+lazy_static! {
+    static ref OPERATORS_PRECEDENCE_TABLES: HashMap<&'static str, (OperatorAssoc, i32)> = vec![
+        ("+", (OperatorAssoc::InfixLeft, 3)),
+        ("*", (OperatorAssoc::InfixLeft, 5))
+    ]
+    .into_iter()
+    .collect();
 }
 
 pub struct ASTBuilder<'a> {
@@ -135,7 +158,12 @@ impl<'a> ASTBuilder<'a> {
                         matches!(frame, Frame::LambdaWaitingForReduction(_))
                     })?;
                 }
-                TokenKind::Operator => todo!(),
+                TokenKind::Operator => {
+                    let repr = &self.contents[token.span.0..token.span.1];
+                    let value = String::from(repr);
+                    let frame = Frame::OperatorWaitingForReduction(value);
+                    self.push_frame(frame);
+                }
                 TokenKind::Match => todo!(),
                 TokenKind::With => todo!(),
                 TokenKind::Let => todo!(),
@@ -235,51 +263,101 @@ impl<'a> ASTBuilder<'a> {
             Frame::LambdaWaitingForReduction(_) => {
                 bail!("ASTBuilder: Empty lambda body after fat arrow")
             }
+            Frame::OperatorAcc(op, assoc, prec, lhs, rhs) => match self.frame_stack.pop() {
+                Some(Frame::AtomsAcc(mut acc)) => {
+                    let ast = match acc.len() {
+                        0 => RawAST::Empty,
+                        1 => acc.pop().wrap_err("unreachable")?,
+                        _ => {
+                            let mut tail = acc.split_off(1);
+                            let head = acc.pop().wrap_err("unreachable")?;
+                            let last = tail.pop().wrap_err("unreachable")?;
+                            RawAST::Application(Box::new(head), tail, Box::new(last))
+                        }
+                    };
+                    let frame = Frame::OperatorAcc(op, assoc, prec, Box::new(ast), rhs);
+                    self.push_frame(frame);
+                    Ok(())
+                }
+                Some(Frame::OperatorAcc(op_, assoc_, prec_, _, _)) => todo!(),
+                Some(frame) => {
+                    self.push_frame(frame);
+                    let ast = RawAST::Operator(op, lhs, rhs);
+                    self.push_frame(Frame::ReducedAST(ast));
+                    Ok(())
+                }
+                None => {
+                    let ast = RawAST::Operator(op, lhs, rhs);
+                    self.push_frame(Frame::ReducedAST(ast));
+                    Ok(())
+                }
+            },
             Frame::ReducedAST(ast) => {
                 if self.frame_stack.is_empty() {
                     self.push_frame(Frame::ReducedAST(ast));
                     Ok(())
                 } else {
                     match self.pop_frame()? {
-                        Frame::AtomsAcc(_) => bail!("ASTBuilder: Ambiguis expression after an atom list, please use parenthesis"),
+                        Frame::AtomsAcc(_) => bail!(
+                            "ASTBuilder: Ambiguis expression after an atom list, please use parenthesis"
+                        ),
                         Frame::TupleAcc(mut acc) => {
                             acc.push(ast);
                             self.push_frame(Frame::TupleAcc(acc));
                             Ok(())
-                        },
-                        Frame::ListAcc(mut acc) =>  {
+                        }
+                        Frame::ListAcc(mut acc) => {
                             acc.push(ast);
                             self.push_frame(Frame::ListAcc(acc));
                             Ok(())
-                        },
+                        }
                         Frame::IfWaitingForThen => {
                             let frame = Frame::IfThenWaitingForElse(Box::new(ast));
                             self.push_frame(frame);
                             Ok(())
-                        },
+                        }
                         Frame::IfThenWaitingForElse(e1) => {
                             let frame = Frame::IfThenElseWaitingForReduction(e1, Box::new(ast));
                             self.push_frame(frame);
                             Ok(())
-                        },
+                        }
                         Frame::IfThenElseWaitingForReduction(e1, e2) => {
                             let e3 = Box::new(ast);
                             let ast = RawAST::IfThenElse(e1, e2, e3);
                             self.push_frame(Frame::ReducedAST(ast));
                             Ok(())
-                        },
+                        }
                         Frame::LambdaWaitingForFatArrow => {
                             let frame = Frame::LambdaWaitingForReduction(Box::new(ast));
                             self.push_frame(frame);
                             Ok(())
-                        },
+                        }
                         Frame::LambdaWaitingForReduction(e1) => {
                             let e2 = Box::new(ast);
                             let ast = RawAST::Lambda(e1, e2);
                             self.push_frame(Frame::ReducedAST(ast));
                             Ok(())
+                        }
+                        Frame::OperatorAcc(op, assoc, prec, _, _) => match assoc {
+                            OperatorAssoc::Postfix => {
+                                bail!("ASTBuilder: Cannot append term on a postfix operator")
+                            }
+                            OperatorAssoc::Prefix => {
+                                let ast =
+                                    RawAST::Operator(op, Box::new(RawAST::Empty), Box::new(ast));
+                                self.push_frame(Frame::ReducedAST(ast));
+                                Ok(())
+                            }
+                            OperatorAssoc::InfixLeft | OperatorAssoc::InfixRight => {
+                                let rhs = Box::new(ast);
+                                let frame = Frame::OperatorAcc(op, assoc, prec, Box::new(RawAST::Empty), rhs);
+                                self.push_frame(frame);
+                                Ok(())
+                            }
                         },
-                        Frame::ReducedAST(_) => bail!("ASTBuilder: Ambiguis expression after another expression, please use parenthesis"),
+                        Frame::ReducedAST(_) => bail!(
+                            "ASTBuilder: Ambiguius expression after another expression, please use parenthesis"
+                        ),
                     }
                 }
             }
