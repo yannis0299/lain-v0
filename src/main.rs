@@ -7,7 +7,7 @@ mod utils;
 use crate::lexer::lexer;
 use crate::stream::TokenStream;
 
-use ast::ASTBuilder;
+use ast::ExprParser;
 use eyre::{ContextCompat, Result};
 use std::env::args;
 use std::fs::File;
@@ -32,8 +32,8 @@ fn do_file(filename: &str) -> Result<()> {
         );
     }
     println!("-- AST: ----------------------");
-    let ast_builder = ASTBuilder::new(&buf);
-    let ast = ast_builder.build(&tokens)?;
+    let expr_parser = ExprParser::new(&buf, &tokens);
+    let ast = expr_parser.parse()?;
     println!("AST = {:#?}", ast);
     println!("------------------------------");
     Ok(())

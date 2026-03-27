@@ -1,4 +1,4 @@
-use eyre::{bail, Result, WrapErr};
+use eyre::{bail, Result};
 
 pub type Matcher<S, T> = dyn Fn(&mut S) -> Result<T> + 'static;
 

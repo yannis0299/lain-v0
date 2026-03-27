@@ -2,8 +2,7 @@ use std::collections::HashMap;
 
 use crate::lexer::{Token, TokenKind};
 
-use eyre::{bail, ContextCompat, Result};
-use fallible_iterator::Empty;
+use eyre::{bail, eyre, ContextCompat, Result};
 use lazy_static::lazy_static;
 
 #[derive(Debug, Clone)]
@@ -18,7 +17,7 @@ pub enum RawAST {
     Tuple(AST, ASTs, AST), // (e1, .., eN) at least 0 elements
     List(ASTs),            // [e1, .., eN] can have 0 elements
     // Composite expression
-    Lambda(AST, AST),            // \ e1 => e2
+    Lambda(AST, AST),            // \e1 => e2
     Application(AST, ASTs, AST), // e1 .. eN
     IfThenElse(AST, AST, AST),   // if e1 then e2 else e3
     Operator(String, AST, AST),  // e1 `op` e2
@@ -28,339 +27,221 @@ pub enum RawAST {
 pub type AST = Box<RawAST>;
 pub type ASTs = Vec<RawAST>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum OperatorAssoc {
-    Postfix,
-    Prefix,
     InfixLeft,
     InfixRight,
 }
 
-#[derive(Debug, Clone)]
-pub enum Frame {
-    AtomsAcc(ASTs),
-    TupleAcc(ASTs),
-    ListAcc(ASTs),
-    IfWaitingForThen,
-    IfThenWaitingForElse(AST),
-    IfThenElseWaitingForReduction(AST, AST),
-    LambdaWaitingForFatArrow,
-    LambdaWaitingForReduction(AST),
-    OperatorAcc(String, OperatorAssoc, i32, AST, AST),
-    ReducedAST(RawAST),
-}
-
 lazy_static! {
-    static ref OPERATORS_PRECEDENCE_TABLES: HashMap<&'static str, (OperatorAssoc, i32)> = vec![
-        ("+", (OperatorAssoc::InfixLeft, 3)),
-        ("*", (OperatorAssoc::InfixLeft, 5))
+    static ref OPERATORS: HashMap<&'static str, (OperatorAssoc, i32)> = vec![
+        ("+", (OperatorAssoc::InfixLeft, 6)),
+        ("-", (OperatorAssoc::InfixLeft, 6)),
+        ("*", (OperatorAssoc::InfixLeft, 7)),
+        ("/", (OperatorAssoc::InfixLeft, 7)),
+        ("$", (OperatorAssoc::InfixRight, 0)),
+        (".", (OperatorAssoc::InfixRight, 9)),
+        ("::", (OperatorAssoc::InfixRight, 5))
     ]
     .into_iter()
     .collect();
 }
 
-pub struct ASTBuilder<'a> {
+pub struct ExprParser<'a> {
     pub contents: &'a str,
-    pub frame_stack: Vec<Frame>,
+    pub pos: usize,
+    pub tokens: &'a [Token],
 }
 
-impl<'a> ASTBuilder<'a> {
-    pub fn build(mut self, tokens: &[Token]) -> Result<AST> {
-        self.eat_tokens(tokens)?;
-        match self.frame_stack.pop() {
-            Some(Frame::ReducedAST(ast)) => Ok(Box::new(ast)),
-            _ => bail!("ASTBuilder: Malformed expression"),
-        }
-    }
-
-    pub fn eat_tokens(&mut self, tokens: &[Token]) -> Result<()> {
-        for token in tokens {
-            match token.kind {
-                TokenKind::Underscore => {
-                    self.push_atom(RawAST::Wildcard);
-                }
-                TokenKind::Integer => {
-                    let repr = &self.contents[token.span.0..token.span.1];
-                    let value = repr.parse()?;
-                    self.push_atom(RawAST::Integer(value));
-                }
-                TokenKind::Identifier => {
-                    let repr = &self.contents[token.span.0..token.span.1];
-                    let value = String::from(repr);
-                    self.push_atom(RawAST::Variable(value));
-                }
-                TokenKind::LeftParen => {
-                    let frame = Frame::TupleAcc(vec![]);
-                    self.push_frame(frame);
-                }
-                TokenKind::LeftBracket => {
-                    let frame = Frame::ListAcc(vec![]);
-                    self.push_frame(frame);
-                }
-                TokenKind::Comma => {
-                    self.reduce_frames_until(|frame| {
-                        matches!(frame, Frame::TupleAcc(_) | Frame::ListAcc(_))
-                    })?;
-                }
-                TokenKind::RightParen => {
-                    self.reduce_frames_until(|frame| matches!(frame, Frame::TupleAcc(_)))?;
-                    match self.pop_frame()? {
-                        Frame::TupleAcc(mut acc) => {
-                            let atom = match acc.len() {
-                                0 => RawAST::Unit,
-                                1 => acc.pop().wrap_err("unreachable")?,
-                                _ => {
-                                    let mut tail = acc.split_off(1);
-                                    let head = acc.pop().wrap_err("unreachable")?;
-                                    let last = tail.pop().wrap_err("unreachable")?;
-                                    RawAST::Tuple(Box::new(head), tail, Box::new(last))
-                                }
-                            };
-                            self.push_atom(atom);
-                        }
-                        _ => bail!(
-                            "ASTBuilder: Attempting to close tuple without an opening parenthesis"
-                        ),
-                    }
-                }
-                TokenKind::RightBracket => {
-                    self.reduce_frames_until(|frame| matches!(frame, Frame::ListAcc(_)))?;
-                    match self.pop_frame()? {
-                        Frame::ListAcc(acc) => {
-                            let atom = RawAST::List(acc);
-                            self.push_atom(atom);
-                        }
-                        _ => {
-                            bail!("ASTBuilder: Attempting to close list without an opening bracket")
-                        }
-                    }
-                }
-                TokenKind::If => {
-                    let frame = Frame::IfWaitingForThen;
-                    self.push_frame(frame);
-                }
-                TokenKind::Then => {
-                    self.reduce_frames_until(|frame| {
-                        matches!(frame, Frame::IfThenWaitingForElse(_))
-                    })?;
-                }
-                TokenKind::Else => {
-                    self.reduce_frames_until(|frame| {
-                        matches!(frame, Frame::IfThenElseWaitingForReduction(_, _))
-                    })?;
-                }
-                TokenKind::Backslash => {
-                    let frame = Frame::LambdaWaitingForFatArrow;
-                    self.push_frame(frame);
-                }
-                TokenKind::RightFatArrow => {
-                    self.reduce_frames_until(|frame| {
-                        matches!(frame, Frame::LambdaWaitingForReduction(_))
-                    })?;
-                }
-                TokenKind::Operator => {
-                    let repr = &self.contents[token.span.0..token.span.1];
-                    let value = String::from(repr);
-                    let frame = Frame::OperatorWaitingForReduction(value);
-                    self.push_frame(frame);
-                }
-                TokenKind::Match => todo!(),
-                TokenKind::With => todo!(),
-                TokenKind::Let => todo!(),
-                TokenKind::Where => todo!(),
-                TokenKind::Do => todo!(),
-                TokenKind::Equal => todo!(),
-                TokenKind::Colon => todo!(),
-                TokenKind::LeftArrow => todo!(),
-                TokenKind::At => todo!(),
-                TokenKind::VerticalLine => todo!(),
-            }
-        }
-        self.reduce_frames_until(|frame| matches!(frame, Frame::ReducedAST(_)))
-    }
-
-    pub fn last_frame(&self) -> Result<&Frame> {
-        self.frame_stack
-            .last()
-            .wrap_err("ASTBuilder: attempting to reference last frame in an empty stack")
-    }
-
-    pub fn new(contents: &'a str) -> Self {
+impl<'a> ExprParser<'a> {
+    pub fn new(contents: &'a str, tokens: &'a [Token]) -> Self {
         Self {
             contents,
-            frame_stack: vec![],
+            pos: 0,
+            tokens,
         }
     }
 
-    pub fn pop_frame(&mut self) -> Result<Frame> {
-        self.frame_stack
-            .pop()
-            .wrap_err("ASTBuilder: attempting to pop last frame in an empty stack")
+    pub fn parse(mut self) -> Result<RawAST> {
+        let expr = self.parse_expr(0)?;
+        Ok(expr)
     }
 
-    pub fn push_atom(&mut self, atom: RawAST) {
-        match self.frame_stack.last_mut() {
-            Some(Frame::AtomsAcc(acc)) => acc.push(atom),
-            _ => self.push_frame(Frame::AtomsAcc(vec![atom])),
-        };
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
     }
 
-    pub fn push_frame(&mut self, frame: Frame) {
-        self.frame_stack.push(frame);
+    fn next(&mut self) -> Option<&Token> {
+        let t = self.tokens.get(self.pos);
+        self.pos += 1;
+        t
     }
 
-    pub fn reduce_frames_until<P>(&mut self, pred: P) -> Result<()>
-    where
-        P: Fn(&Frame) -> bool + 'static,
-    {
-        loop {
-            self.reduce_top_frame()?;
-            if self.frame_stack.is_empty() || (pred)(self.last_frame()?) {
-                break;
-            }
+    fn expect(&mut self, kind: TokenKind) -> Result<()> {
+        match self.next() {
+            Some(t) if t.kind == kind => Ok(()),
+            _ => bail!("ExprParser: Expected {:?}", kind),
         }
-        Ok(())
     }
 
-    pub fn reduce_top_frame(&mut self) -> Result<()> {
-        match self.pop_frame()? {
-            Frame::AtomsAcc(mut acc) => {
-                let ast = match acc.len() {
-                    0 => RawAST::Empty,
-                    1 => acc.pop().wrap_err("unreachable")?,
-                    _ => {
-                        let mut tail = acc.split_off(1);
-                        let head = acc.pop().wrap_err("unreachable")?;
-                        let last = tail.pop().wrap_err("unreachable")?;
-                        RawAST::Application(Box::new(head), tail, Box::new(last))
-                    }
-                };
-                self.push_frame(Frame::ReducedAST(ast));
-                Ok(())
-            }
-            Frame::TupleAcc(mut acc) => {
-                acc.push(RawAST::Empty);
-                self.push_frame(Frame::TupleAcc(acc));
-                Ok(())
-            }
-            Frame::ListAcc(mut acc) => {
-                acc.push(RawAST::Empty);
-                self.push_frame(Frame::TupleAcc(acc));
-                Ok(())
-            }
-            Frame::IfWaitingForThen => {
-                bail!("ASTBuilder: Empty expression between if and then tokens")
-            }
-            Frame::IfThenWaitingForElse(_) => {
-                bail!("ASTBuilder: Empty expression between then and else tokens")
-            }
-            Frame::IfThenElseWaitingForReduction(_, _) => {
-                bail!("ASTBuilder: Empty expression after else token")
-            }
-            Frame::LambdaWaitingForFatArrow => {
-                bail!("ASTBuilder: Empty expression backslash and fat arrow")
-            }
-            Frame::LambdaWaitingForReduction(_) => {
-                bail!("ASTBuilder: Empty lambda body after fat arrow")
-            }
-            Frame::OperatorAcc(op, assoc, prec, lhs, rhs) => match self.frame_stack.pop() {
-                Some(Frame::AtomsAcc(mut acc)) => {
-                    let ast = match acc.len() {
-                        0 => RawAST::Empty,
-                        1 => acc.pop().wrap_err("unreachable")?,
-                        _ => {
-                            let mut tail = acc.split_off(1);
-                            let head = acc.pop().wrap_err("unreachable")?;
-                            let last = tail.pop().wrap_err("unreachable")?;
-                            RawAST::Application(Box::new(head), tail, Box::new(last))
-                        }
+    fn parse_expr(&mut self, min_prec: i32) -> Result<RawAST> {
+        match self.peek() {
+            None => Ok(RawAST::Empty),
+            Some(token)
+                if matches!(
+                    token.kind,
+                    TokenKind::Integer
+                        | TokenKind::Underscore
+                        | TokenKind::Identifier
+                        | TokenKind::LeftParen
+                        | TokenKind::LeftBracket
+                ) =>
+            {
+                let mut lhs = self.parse_atoms()?;
+                loop {
+                    let op_token = match self.peek() {
+                        Some(t) if matches!(t.kind, TokenKind::Operator) => t,
+                        _ => break,
                     };
-                    let frame = Frame::OperatorAcc(op, assoc, prec, Box::new(ast), rhs);
-                    self.push_frame(frame);
-                    Ok(())
+                    let op_str = &self.contents[op_token.span.0..op_token.span.1];
+                    let (assoc, prec) = match OPERATORS.get(op_str) {
+                        Some(v) => *v,
+                        None => bail!("ExprParser: Unknown operator {:?}", op_str),
+                    };
+                    if prec < min_prec {
+                        break;
+                    }
+                    self.next(); // consume operator
+                    let next_min_prec = match assoc {
+                        OperatorAssoc::InfixLeft => prec + 1,
+                        OperatorAssoc::InfixRight => prec,
+                    };
+                    let rhs = self.parse_expr(next_min_prec)?;
+                    lhs = RawAST::Operator(op_str.to_string(), Box::new(lhs), Box::new(rhs));
                 }
-                Some(Frame::OperatorAcc(op_, assoc_, prec_, _, _)) => todo!(),
-                Some(frame) => {
-                    self.push_frame(frame);
-                    let ast = RawAST::Operator(op, lhs, rhs);
-                    self.push_frame(Frame::ReducedAST(ast));
-                    Ok(())
+                Ok(lhs)
+            }
+            Some(token) if matches!(token.kind, TokenKind::If | TokenKind::Backslash) => {
+                let token = self.next().wrap_err("unreachable")?;
+                match token.kind {
+                    TokenKind::If => {
+                        let cond = self.parse_expr(0)?;
+                        self.expect(TokenKind::Then)?;
+                        let then_branch = self.parse_expr(0)?;
+                        self.expect(TokenKind::Else)?;
+                        let else_branch = self.parse_expr(0)?;
+                        Ok(RawAST::IfThenElse(
+                            Box::new(cond),
+                            Box::new(then_branch),
+                            Box::new(else_branch),
+                        ))
+                    }
+                    TokenKind::Backslash => {
+                        let param = self.parse_atoms()?;
+                        self.expect(TokenKind::RightFatArrow)?;
+                        let body = self.parse_expr(0)?;
+                        Ok(RawAST::Lambda(Box::new(param), Box::new(body)))
+                    }
+                    _ => bail!("unreachable"),
                 }
-                None => {
-                    let ast = RawAST::Operator(op, lhs, rhs);
-                    self.push_frame(Frame::ReducedAST(ast));
-                    Ok(())
+            }
+            Some(token) if matches!(token.kind, TokenKind::Operator) => {
+                let mut lhs = RawAST::Empty;
+                let op_token = self.next().wrap_err("unreachable")?.clone();
+                let op_str = &self.contents[op_token.span.0..op_token.span.1];
+                let rhs = self.parse_atoms()?;
+                lhs = RawAST::Operator(op_str.to_string(), Box::new(lhs), Box::new(rhs));
+                Ok(lhs)
+            }
+            _token => Ok(RawAST::Empty),
+        }
+    }
+
+    fn parse_atoms(&mut self) -> Result<RawAST> {
+        let mut acc = vec![];
+        loop {
+            match self.peek() {
+                Some(token)
+                    if matches!(
+                        token.kind,
+                        TokenKind::Integer
+                            | TokenKind::Identifier
+                            | TokenKind::Underscore
+                            | TokenKind::LeftParen
+                            | TokenKind::LeftBracket
+                    ) =>
+                {
+                    let atom = self.parse_atom()?;
+                    acc.push(atom);
                 }
-            },
-            Frame::ReducedAST(ast) => {
-                if self.frame_stack.is_empty() {
-                    self.push_frame(Frame::ReducedAST(ast));
-                    Ok(())
-                } else {
-                    match self.pop_frame()? {
-                        Frame::AtomsAcc(_) => bail!(
-                            "ASTBuilder: Ambiguis expression after an atom list, please use parenthesis"
-                        ),
-                        Frame::TupleAcc(mut acc) => {
-                            acc.push(ast);
-                            self.push_frame(Frame::TupleAcc(acc));
-                            Ok(())
-                        }
-                        Frame::ListAcc(mut acc) => {
-                            acc.push(ast);
-                            self.push_frame(Frame::ListAcc(acc));
-                            Ok(())
-                        }
-                        Frame::IfWaitingForThen => {
-                            let frame = Frame::IfThenWaitingForElse(Box::new(ast));
-                            self.push_frame(frame);
-                            Ok(())
-                        }
-                        Frame::IfThenWaitingForElse(e1) => {
-                            let frame = Frame::IfThenElseWaitingForReduction(e1, Box::new(ast));
-                            self.push_frame(frame);
-                            Ok(())
-                        }
-                        Frame::IfThenElseWaitingForReduction(e1, e2) => {
-                            let e3 = Box::new(ast);
-                            let ast = RawAST::IfThenElse(e1, e2, e3);
-                            self.push_frame(Frame::ReducedAST(ast));
-                            Ok(())
-                        }
-                        Frame::LambdaWaitingForFatArrow => {
-                            let frame = Frame::LambdaWaitingForReduction(Box::new(ast));
-                            self.push_frame(frame);
-                            Ok(())
-                        }
-                        Frame::LambdaWaitingForReduction(e1) => {
-                            let e2 = Box::new(ast);
-                            let ast = RawAST::Lambda(e1, e2);
-                            self.push_frame(Frame::ReducedAST(ast));
-                            Ok(())
-                        }
-                        Frame::OperatorAcc(op, assoc, prec, _, _) => match assoc {
-                            OperatorAssoc::Postfix => {
-                                bail!("ASTBuilder: Cannot append term on a postfix operator")
-                            }
-                            OperatorAssoc::Prefix => {
-                                let ast =
-                                    RawAST::Operator(op, Box::new(RawAST::Empty), Box::new(ast));
-                                self.push_frame(Frame::ReducedAST(ast));
-                                Ok(())
-                            }
-                            OperatorAssoc::InfixLeft | OperatorAssoc::InfixRight => {
-                                let rhs = Box::new(ast);
-                                let frame = Frame::OperatorAcc(op, assoc, prec, Box::new(RawAST::Empty), rhs);
-                                self.push_frame(frame);
-                                Ok(())
-                            }
-                        },
-                        Frame::ReducedAST(_) => bail!(
-                            "ASTBuilder: Ambiguius expression after another expression, please use parenthesis"
-                        ),
+                _ => break,
+            }
+        }
+        match acc.len() {
+            0 => Ok(RawAST::Empty),
+            1 => acc.pop().wrap_err("unreachable"),
+            _ => {
+                let last = acc.pop().wrap_err("unreachable")?;
+                let tail = acc.split_off(1);
+                let head = acc.pop().wrap_err("unreachable")?;
+                Ok(RawAST::Application(Box::new(head), tail, Box::new(last)))
+            }
+        }
+    }
+
+    fn parse_atom(&mut self) -> Result<RawAST> {
+        let token = self.next().wrap_err("ExprParser: Unexpected EOF")?.clone();
+        match token.kind {
+            TokenKind::Integer => {
+                let s = &self.contents[token.span.0..token.span.1];
+                let value = s.parse()?;
+                Ok(RawAST::Integer(value))
+            }
+            TokenKind::Identifier => {
+                let s = &self.contents[token.span.0..token.span.1];
+                let value = s.to_string();
+                Ok(RawAST::Variable(value))
+            }
+            TokenKind::Underscore => Ok(RawAST::Wildcard),
+            TokenKind::LeftParen => {
+                let mut acc = vec![];
+                loop {
+                    let expr = self.parse_expr(0)?;
+                    acc.push(expr);
+                    match self.next() {
+                        Some(t) if matches!(t.kind, TokenKind::RightParen) => break,
+                        Some(t) if matches!(t.kind, TokenKind::Comma) => continue,
+                        _ => bail!("ExprParser: Expected ')' or ',' while accumulating a tuple"),
+                    }
+                }
+                match acc.len() {
+                    0 => Ok(RawAST::Unit),
+                    1 => match acc.pop().wrap_err("unreachable")? {
+                        RawAST::Empty => Ok(RawAST::Unit),
+                        ast => Ok(ast),
+                    },
+                    _ => {
+                        let last = acc.pop().wrap_err("unreachable")?;
+                        let tail = acc.split_off(1);
+                        let head = acc.pop().wrap_err("unreachable")?;
+                        Ok(RawAST::Tuple(Box::new(head), tail, Box::new(last)))
                     }
                 }
             }
+            TokenKind::LeftBracket => {
+                let mut acc = vec![];
+                loop {
+                    let expr = self.parse_expr(0)?;
+                    acc.push(expr);
+                    match self.next() {
+                        Some(t) if matches!(t.kind, TokenKind::RightBracket) => break,
+                        Some(t) if matches!(t.kind, TokenKind::Comma) => continue,
+                        _ => bail!("ExprParser: Expected ']' or ',' while accumulating a tuple"),
+                    }
+                }
+                Ok(RawAST::List(acc))
+            }
+            _ => bail!("ExprParser: ExprParser: Unexpected token {:?}", token.kind),
         }
     }
 }
